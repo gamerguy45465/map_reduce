@@ -1,6 +1,9 @@
 package main
 
-import "database/sql"
+import (
+	"database/sql"
+	"log"
+)
 
 func openDatabase(path string) (*sql.DB, error) {
 	// the path to the database--this could be an absolute path
@@ -14,8 +17,12 @@ func openDatabase(path string) (*sql.DB, error) {
 			"&" + "_synchronous=OFF"
 	db, err := sql.Open("sqlite3", path+options)
 	if err != nil {
+		log.Print("Error: ", err)
+		return db, err
 		// handle the error here
-	} 
+	}
+
+	return db, nil
 }
 
 func createDatabase(path string) (*sql.DB, error) {
