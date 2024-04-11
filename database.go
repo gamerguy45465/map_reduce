@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
 )
 
@@ -25,7 +26,7 @@ func openDatabase(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-func createDatabase(path string) (*sql.DB, error) {
+/*func createDatabase(path string) (*sql.DB, error) {
 
 }
 
@@ -43,8 +44,9 @@ func download(url, path string) error {
 
 func gatherInfo(db *sql.DB, path string) error {
 
-}
+}*/
 
 func main() {
-
+	path := "austen.db"
+	fmt.Println(openDatabase(path))
 }
