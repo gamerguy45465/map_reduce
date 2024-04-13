@@ -1,15 +1,43 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
+	"unicode"
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+type MapTask struct {
+	M, R       int    // total number of map and reduce tasks
+	N          int    // map task number, 0-based
+	SourceHost string // address of host with map input file
+}
+
+type ReduceTask struct {
+	M, R        int      // total number of map and reduce tasks
+	N           int      // reduce task number, 0-based
+	SourceHosts []string // addresses of map workers
+}
+
+type Pair struct {
+	Key   string
+	Value string
+}
+
+type Interface interface {
+	Map(key, value string, output chan<- Pair) error
+	Reduce(key string, values <-chan string, output chan<- Pair) error
+}
+
+type Client struct{}
 
 func openDatabase(path string) (*sql.DB, error) {
 	if _, err := os.Stat(path); err != nil {
@@ -209,6 +237,40 @@ func gatherInto(db *sql.DB, path string) error {
 	return os.Remove(path)
 }
 
+func mapSourceFile(m int) string {
+	return fmt.Sprintf("map_%d_source.db", m)
+}
+
+func mapInputFile(m int) string {
+	return fmt.Sprintf("map_%d_input.db", m)
+}
+
+func mapOutputFile(m, r int) string {
+	return fmt.Sprintf("map_%d_output_%d.db", m, r)
+}
+
+func reduceInputFile(r int) string {
+	return fmt.Sprintf("reduce_%d_input.db", r)
+}
+
+func reduceOutputFile(r int) string {
+	return fmt.Sprintf("reduce_%d_output.db", r)
+}
+
+func reducePartialFile(r int) string {
+	return fmt.Sprintf("reduce_%d_partial.db", r)
+}
+
+func reduceTempFile(r int) string {
+	return fmt.Sprintf("reduce_%d_temp.db", r)
+}
+
+func makeURL(host, file string) string {
+	return fmt.Sprintf("http://%s/data/%s", host, file)
+}
+
+// Part 2
+
 func getNumberOfRows(path string) (int, error) {
 	var number_of_rows string
 	db, err := openDatabase(path)
@@ -237,27 +299,227 @@ func getNumberOfRows(path string) (int, error) {
 
 	rows.Close()
 
-	return count, err
+	count, er := strconv.Atoi(number_of_rows)
+	return count, er
+}
 
+func getDatabaseSize(path string) (int, int, error) {
+	var page_count string
+	var page_size string
+	db, err := openDatabase(path)
+	if err != nil {
+		log.Printf("error in op")
+		return 0, 0, err
+
+	}
+	defer db.Close()
+
+	rows, err := db.Query("PRAGMA page_count")
+	if err != nil {
+		log.Printf("error in pragma query from database to page_count: %v", err)
+		return 0, 0, err
+	}
+
+	defer rows.Close()
+	for rows.Next() {
+		if err = rows.Scan(&page_count); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	rows, err = db.Query("PRAGMA page_size")
+	if err != nil {
+		log.Printf("error in pragma query from database to page_size: %v", err)
+		return 0, 0, err
+	}
+
+	defer rows.Close()
+	for rows.Next() {
+		if err = rows.Scan(&page_size); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	pg_count, er := strconv.Atoi(page_count)
+	pg_size, errr := strconv.Atoi(page_size)
+	if er != nil {
+		err = er
+	}
+
+	if errr != nil {
+		err = errr
+	}
+
+	return pg_count, pg_size, err
+}
+
+func createPaths(amount int) []string {
+	i := 1
+	var paths []string
+	for i < amount+1 {
+		paths = append(paths, mapInputFile(i))
+		i += 1
+	}
+	return paths
+}
+
+func (c Client) Map(key, value string, output chan<- Pair) error {
+	defer close(output)
+	lst := strings.Fields(value)
+	for _, elt := range lst {
+		word := strings.Map(func(r rune) rune {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				return unicode.ToLower(r)
+			}
+			return -1
+		}, elt)
+		if len(word) > 0 {
+			output <- Pair{Key: word, Value: "1"}
+		}
+	}
+	return nil
+}
+
+func (c Client) Reduce(key string, values <-chan string, output chan<- Pair) error {
+	defer close(output)
+	count := 0
+	for v := range values {
+		i, err := strconv.Atoi(v)
+		if err != nil {
+			return err
+		}
+		count += i
+	}
+	p := Pair{Key: key, Value: strconv.Itoa(count)}
+	output <- p
+	return nil
+}
+
+func (task *MapTask) Process(path string, client Interface) error {
+	db, err := openDatabase(path)
+	if err != nil {
+		log.Printf("error in op")
+		return err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("select key, value from pairs")
+	defer rows.Close()
+	if err != nil {
+		log.Printf("error in select query from database to get pairs: %v", err)
+		return err
+	}
+
+	// for key, value from input
+	var key string
+	var value string
+
+	for rows.Next() {
+		if err = rows.Scan(&key, &value); err != nil {
+			return err
+		}
+
+		// map process
+		// ... spin up goroutine then call map
+		// map(key, value)
+
+		output := make(chan Pair)
+		Client := new(Client)
+		err = Client.Map(key, value, output)
+		if err != nil {
+			log.Fatalf("Client.Map: %v", err)
+		}
+
+		fmt.Println(output)
+
+		//hash := fnv.New32() // from the stdlib package hash/fnv
+		//hash.Write([]byte(pair.Key))
+		//r := int(hash.Sum32() % uint32(task.R))
+
+	}
+	rows.Close()
+
+	return err
+}
+
+func shell(client *Interface) {
+	scanner := bufio.NewScanner(os.Stdin)
+	path := "austen.db"
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		var command string
+		var input string
+
+		fmt.Sscanf(line, "%s %s", &command, &input)
+
+		switch command {
+		case "quit":
+			return
+
+		case "write":
+			if input != "" {
+				path = input
+			}
+
+			number_of_rows, _ := getNumberOfRows(path)
+			page_count, _, _ := getDatabaseSize(path)
+
+			PATHS_AMOUNT := number_of_rows / page_count
+			PATHS := createPaths(PATHS_AMOUNT)
+			err := splitDatabase(path, PATHS)
+			if err != nil {
+				log.Fatalf("There was an error")
+			}
+
+			path_index := 0
+			for path_index < len(PATHS) {
+				p := PATHS[path_index]
+
+				// make a new map task
+				MapWorker := new(MapTask)
+				MapWorker.SourceHost = p
+				MapWorker.N = path_index
+				err = MapWorker.Process(p, *client)
+				if err != nil {
+					log.Fatalf("MapWorker.Process: error: %v", err)
+				}
+			}
+
+			// make a new reduce task
+
+			break
+
+		case "help":
+			fmt.Println("Here are a list of commands to use:\nquit\nwrite\n")
+			break
+
+		default:
+			log.Print("Error: Unrecognized command. Please type \"help\" for a list of commands.")
+		}
+
+	}
 }
 
 func main() {
-	path := "austen.db"
-	path2 := "createDatabase.db"
 
-	db2, err2 := createDatabase(path2)
-	fmt.Println(db2)
-	fmt.Println(err2, "\n\n\n")
+	// Introduction
+	log.Print("Map Reduce -- Part 1")
+	log.Print("By: Jordan Coleman & Hailey Whipple")
 
-	db, err := openDatabase(path2)
-	fmt.Println(db)
-	fmt.Println(err, "\n\n\n")
+	client := new(Interface)
+	shell(client)
 
-	go func() {
-		address := "localhost:8080"
-		http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir(path2))))
-		if err := http.ListenAndServe(address, nil); err != nil {
-			log.Printf("Error in HTTP server for %s: %v", address, err)
-		}
-	}()
+	/*
+		go func() {
+			for {
+				address := "localhost:8080"
+				http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir(path))))
+				if err := http.ListenAndServe(address, nil); err != nil {
+					log.Printf("Error in HTTP server for %s: %v", address, err)
+				}
+			}
+		}()
+	*/
+
 }
