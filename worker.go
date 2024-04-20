@@ -29,14 +29,22 @@ type Pair struct {
 	Value string
 }
 
-type Pairs struct {
-	pairs []Pair
-}
-
 type Interface interface {
 	Map(key, value string, output chan<- Pair) error
 	Reduce(key string, values <-chan string, output chan<- Pair) error
 }
+
+type Client struct{}
+
+const (
+	mapSource = iota
+	mapInput
+	mapOutput
+	reduceInput
+	reduceOutput
+	reducePartial
+	reduceTemp
+)
 
 func mapSourceFile(m int) string {
 	return fmt.Sprintf("map_%d_source.db", m)
@@ -120,6 +128,41 @@ func (c Client) Reduce(key string, values <-chan string, output chan<- Pair) err
 	return nil
 }
 
+func createPaths(amount int, typeOfFile int, tmp string) []string {
+	i := 0
+	var paths []string
+	for i < amount {
+		switch typeOfFile {
+		case mapSource:
+			paths = append(paths, filepath.Join(tmp, mapSourceFile(i)))
+		case mapInput:
+			paths = append(paths, filepath.Join(tmp, mapInputFile(i)))
+		case mapOutput:
+			paths = append(paths, filepath.Join(tmp, mapOutputFile(amount, i)))
+		case reduceInput:
+			paths = append(paths, filepath.Join(tmp, reduceInputFile(i)))
+		case reduceOutput:
+			paths = append(paths, filepath.Join(tmp, reduceOutputFile(i)))
+		case reducePartial:
+			paths = append(paths, filepath.Join(tmp, reducePartialFile(i)))
+		case reduceTemp:
+			paths = append(paths, filepath.Join(tmp, reduceTempFile(i)))
+		}
+		i += 1
+	}
+	return paths
+}
+
+func InsertPairs(task *MapTask, output []Pair) error {
+	// will insert pairs
+	source := task.SourceHost
+	n := task.N
+	for _, pair := range output {
+		fmt.Println(source, n, pair)
+	}
+	return nil
+}
+
 func (task *MapTask) Process(path string, client Interface) error {
 	db, err := openDatabase(path)
 	if err != nil {
@@ -139,7 +182,7 @@ func (task *MapTask) Process(path string, client Interface) error {
 	var key string
 	var value string
 
-	final_output := new(Pairs)
+	var final_output []Pair
 	Client := new(Client)
 
 	for rows.Next() {
@@ -161,7 +204,7 @@ func (task *MapTask) Process(path string, client Interface) error {
 		}()
 
 		for pair := range output {
-			final_output.pairs = append(final_output.pairs, pair)
+			final_output = append(final_output, pair)
 		}
 
 		//hash := fnv.New32() // from the stdlib package hash/fnv
@@ -171,8 +214,9 @@ func (task *MapTask) Process(path string, client Interface) error {
 	}
 	rows.Close()
 
-	for pair := range final_output.pairs {
-		fmt.Println(pair)
+	err = InsertPairs(task, final_output)
+	if err != nil {
+		log.Printf("MapTask.Process: InsertPairs: %v", err)
 	}
 
 	return err
@@ -200,8 +244,14 @@ func main() {
 	log.Print("Map Reduce -- Part 1")
 	log.Print("By: Jordan Coleman & Hailey Whipple")
 
-	m := 10
-	r := 5
+	number_of_rows, _ := getNumberOfRows(path)
+	page_count, _, _ := getDatabaseSize(path)
+
+	var m int = number_of_rows / page_count
+	var r int = m / 2
+
+	//m := 10
+	//r := 5
 
 	source := "source.db"
 
@@ -221,9 +271,15 @@ func main() {
 
 	var paths []string
 
+	/*
 	for i := 0; i < m; i++ {
 		paths = append(paths, filepath.Join(tempdir, mapSourceFile(i)))
 	}
+	*/
+
+	paths := createPaths(amount, mapSource, tempdir)
+
+
 	if err := splitDatabase(source, paths); err != nil {
 		log.Fatalf("splitting database: %v", err)
 	}
@@ -258,7 +314,7 @@ func main() {
 		mapTasks = append(mapTasks, task)
 	}
 
-	//This is where we are building our reduce tasks
+	// This is where we are building our reduce tasks
 
 	var reduceTasks []*ReduceTask
 
@@ -274,7 +330,7 @@ func main() {
 
 	var client Client
 
-	//This is where we are processing the map tasks
+	// This is where we are processing the map tasks
 	for i, task := range mapTasks {
 		if err := task.Process(tempdir, client); err != nil {
 			log.Fatalf("there was an error with processing the maptask: ", i, err)
@@ -302,3 +358,5 @@ func main() {
 	*/
 
 }
+
+// go run *.go
