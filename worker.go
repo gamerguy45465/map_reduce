@@ -1,7 +1,9 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net"
 	"net/http"
@@ -79,7 +81,7 @@ func makeURL(host, file string) string {
 }
 
 func getLocalAddress() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+	conn, err := net.Dial("udp", "8.8.8.8:8080")
 
 	if err != nil {
 		log.Fatalf("No, getLocalAddress did not work")
@@ -153,18 +155,58 @@ func createPaths(amount int, typeOfFile int, tmp string) []string {
 	return paths
 }
 
+func getDatabase(path string) (*sql.DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return createDatabase(path)
+		}
+	}
+	return openDatabase(path)
+}
+
 func InsertPairs(task *MapTask, output []Pair) error {
 	// will insert pairs
-	source := task.SourceHost
+
 	n := task.N
 	for _, pair := range output {
-		fmt.Println(source, n, pair)
+		hash := fnv.New32()
+		hash.Write([]byte(pair.Key))
+		r := int(hash.Sum32() % uint32(task.R))
+		outputDB := mapOutputFile(n, r)
+		db, err := getDatabase(outputDB)
+		if err != nil {
+			db.Close()
+			log.Fatalf("InsertPairs: getDatabase: %v", err)
+			return err
+		}
+
+		// insert pairs into the output DB
+		_, err = db.Exec("INSERT INTO pairs (key, value) VALUES (?, ?)", pair.Key, pair.Value)
+		if err != nil {
+			db.Close()
+			log.Fatalf("InsertPairs: error inserting pairs into database: %v", err)
+			return err
+		}
+
+		db.Close()
 	}
 	return nil
 }
 
 func (task *MapTask) Process(path string, client Interface) error {
-	db, err := openDatabase(path)
+	// make URL
+	file := mapSourceFile(task.N)
+	url := makeURL(getLocalAddress()+":8080", file)
+	mapFile := mapInputFile(task.N)
+
+	err := download(url, mapFile)
+	if err != nil {
+		log.Printf("MapTask.Process: error in downloading path %s: %v", path, err)
+	}
+
+	var db *sql.DB
+
+	db, err = openDatabase(mapFile)
 	if err != nil {
 		log.Printf("error in op")
 		return err
@@ -185,33 +227,31 @@ func (task *MapTask) Process(path string, client Interface) error {
 	var final_output []Pair
 	Client := new(Client)
 
-	for rows.Next() {
-		if err = rows.Scan(&key, &value); err != nil {
-			return err
-		}
+	// map process
+	// ... spin up goroutine
+	go func() {
+		for rows.Next() {
+			if err = rows.Scan(&key, &value); err != nil {
+				log.Fatalf("MapTask.Process: error scanning rows: %v", err)
+			}
 
-		// map process
-		// ... spin up goroutine then call map
-		// map(key, value)
+			// call map
+			output := make(chan Pair)
 
-		output := make(chan Pair)
-
-		go func() {
 			err = Client.Map(key, value, output)
 			if err != nil {
 				log.Printf("Client.Map: %v", err)
 			}
-		}()
 
-		for pair := range output {
-			final_output = append(final_output, pair)
+			// output
+			go func() {
+				for pair := range output {
+					final_output = append(final_output, pair)
+				}
+			}()
+			task.M++
 		}
-
-		//hash := fnv.New32() // from the stdlib package hash/fnv
-		//hash.Write([]byte(pair.Key))
-		//r := int(hash.Sum32() % uint32(task.R))
-		task.M++
-	}
+	}()
 	rows.Close()
 
 	err = InsertPairs(task, final_output)
@@ -225,15 +265,61 @@ func (task *MapTask) Process(path string, client Interface) error {
 //Process for ReduceTask
 
 func (task *ReduceTask) Process(path string, client Interface) error {
-	db, err := openDatabase(path)
+	var urls []string
+	m := task.M
+	i := 0
+	for i < m {
+		file := mapOutputFile(i, task.N)
+		url := makeURL(getLocalAddress()+":8080", file)
+		urls = append(urls, url)
+		i++
+	}
+
+	db, err := mergeDatabases(urls, reduceInputFile(task.N), path)
 
 	if err != nil {
-		log.Fatalf("No")
+		log.Fatalf("No, merge did not work for some reason ", err)
+		return err
+
+	}
+	rows, _ := db.Query("select key, value from pairs order by key, value")
+
+	defer rows.Close()
+
+	// for key, value from input
+	var key string
+	var value string
+
+	//var final_output []Pair
+	//Client := new(Client)
+
+	var keys []string
+
+	i = 0
+
+	for rows.Next() {
+		if err = rows.Scan(&key, &value); err != nil {
+			return err
+		}
+
+		fmt.Println("Ran")
+
+		output := make(chan Pair)
+
+		keys = append(keys, key)
+		if i != 0 {
+			if keys[i-1] != key {
+				output <- Pair{key, value}
+
+			}
+		}
+
+		i++
 
 	}
 
-	//TODO: Need to merge given databases (whatever databases we are talking about, considering the function only has one path string given)
-	//TODO: Create an ouput database
+	return err
+
 	//TODO: Need to process all pairs in correct order
 
 }
@@ -244,8 +330,11 @@ func main() {
 	log.Print("Map Reduce -- Part 1")
 	log.Print("By: Jordan Coleman & Hailey Whipple")
 
-	number_of_rows, _ := getNumberOfRows(path)
-	page_count, _, _ := getDatabaseSize(path)
+	//path := "source.db"
+	source := "austen.db"
+
+	number_of_rows, _ := getNumberOfRows(source)
+	page_count, _, _ := getDatabaseSize(source)
 
 	var m int = number_of_rows / page_count
 	var r int = m / 2
@@ -253,7 +342,7 @@ func main() {
 	//m := 10
 	//r := 5
 
-	source := "source.db"
+	//source := "austin.db"
 
 	tmp := os.TempDir()
 
@@ -271,21 +360,20 @@ func main() {
 
 	var paths []string
 
+	paths = createPaths(m, mapSource, tempdir)
+
 	/*
-	for i := 0; i < m; i++ {
-		paths = append(paths, filepath.Join(tempdir, mapSourceFile(i)))
-	}
+		for i := 0; i < m; i++ {
+			paths = append(paths, filepath.Join(tempdir, mapSourceFile(i)))
+		}
 	*/
-
-	paths := createPaths(amount, mapSource, tempdir)
-
 
 	if err := splitDatabase(source, paths); err != nil {
 		log.Fatalf("splitting database: %v", err)
 	}
 
 	the_address := net.JoinHostPort(getLocalAddress(), "8080")
-	log.Print("Here is a new address that we are starting an http server with and it is", the_address)
+	log.Print("Here is a new address that we are starting an http server with and it is ", the_address)
 
 	http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir(tempdir))))
 
@@ -340,10 +428,12 @@ func main() {
 		}
 	}
 
+	fmt.Println("processed all of map tasks")
+
 	//This is where we are processing the reduce tasks
 
 	for i, task := range reduceTasks {
-		if err := task.Process(tempdir, client); err != nil {
+		if err := task.Process(tempdir, client); err != nil { //
 			log.Fatalf("there was an error with processing the reduce task: ", i, err)
 		}
 	}

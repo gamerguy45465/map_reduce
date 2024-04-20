@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"fmt"
 	"io"
@@ -12,8 +11,6 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 )
-
-type Client struct{}
 
 func openDatabase(path string) (*sql.DB, error) {
 	if _, err := os.Stat(path); err != nil {
@@ -297,7 +294,7 @@ func getDatabaseSize(path string) (int, int, error) {
 	return pg_count, pg_size, err
 }
 
-func createPaths(amount int) []string {
+/*func createPaths(amount int) []string {
 	i := 1
 	var paths []string
 	for i < amount+1 {
@@ -305,9 +302,9 @@ func createPaths(amount int) []string {
 		i += 1
 	}
 	return paths
-}
+} */
 
-func shell(client *Interface) {
+/*func shell(client *Interface) {
 	scanner := bufio.NewScanner(os.Stdin)
 	path := "austen.db"
 	for scanner.Scan() {
@@ -365,4 +362,4 @@ func shell(client *Interface) {
 		}
 
 	}
-}
+} */
