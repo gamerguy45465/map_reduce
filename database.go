@@ -137,6 +137,7 @@ func splitDatabase(source string, paths []string) error {
 func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
 	// create the output file
 	db, err := createDatabase(path)
+	fmt.Println("This is the err ", err)
 	if err != nil {
 		return nil, err
 	}
@@ -144,10 +145,12 @@ func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
 	// gather them one at a time
 	for _, u := range urls {
 		if err := download(u, temp); err != nil {
+			fmt.Println("Download err ", err)
 			db.Close()
 			return nil, err
 		}
 		if err := gatherInto(db, temp); err != nil {
+			fmt.Println("Gather err ", err)
 			db.Close()
 			return nil, err
 		}
@@ -169,6 +172,8 @@ func download(url, path string) error {
 		log.Printf("%v", err)
 		return err
 	}
+
+	fmt.Println(path)
 	fp, err := os.Create(path)
 	if err != nil {
 		log.Printf("error creating intermediate file %s for download: %v", path, err)

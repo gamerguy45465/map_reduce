@@ -198,8 +198,15 @@ func (task *MapTask) Process(path string, client Interface) error {
 	file := mapSourceFile(task.N)
 	url := makeURL(getLocalAddress()+":8080", file)
 	mapFile := mapInputFile(task.N)
+	url2 := makeURL(getLocalAddress()+":8080", mapFile)
 
-	err := download(url, mapFile)
+	err := download(url, file)
+	if err != nil {
+		log.Printf("MapTask.Process: error in downloading path %s: %v", path, err)
+	}
+
+	err = download(url2, mapFile)
+
 	if err != nil {
 		log.Printf("MapTask.Process: error in downloading path %s: %v", path, err)
 	}
@@ -267,6 +274,8 @@ func (task *MapTask) Process(path string, client Interface) error {
 func (task *ReduceTask) Process(path string, client Interface) error {
 	var urls []string
 	m := task.M
+	//n := task.N
+	//r := task.R
 	i := 0
 	for i < m {
 		file := mapOutputFile(i, task.N)
@@ -275,7 +284,13 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 		i++
 	}
 
-	db, err := mergeDatabases(urls, reduceInputFile(task.N), path)
+	//temp_file := reduceTempFile(task.N)
+	file := reduceInputFile(task.N)
+
+	fmt.Println(urls)
+
+	//db, err := mergeDatabases(urls, reduceInputFile(task.N), path)
+	db, err := mergeDatabases(urls, file, path)
 
 	if err != nil {
 		log.Fatalf("No, merge did not work for some reason ", err)
@@ -294,29 +309,37 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 	//Client := new(Client)
 
 	var keys []string
+	var values <-chan string
 
 	i = 0
 
-	for rows.Next() {
-		if err = rows.Scan(&key, &value); err != nil {
-			return err
-		}
+	go func() error {
 
-		fmt.Println("Ran")
-
-		output := make(chan Pair)
-
-		keys = append(keys, key)
-		if i != 0 {
-			if keys[i-1] != key {
-				output <- Pair{key, value}
-
+		for rows.Next() {
+			if err := rows.Scan(&key, &value); err != nil {
+				return err
 			}
+
+			fmt.Println("Ran")
+
+			output := make(chan Pair)
+
+			err = client.Reduce(key, values, output)
+
+			keys = append(keys, key)
+			if i != 0 {
+				if keys[i-1] != key {
+					output <- Pair{key, value}
+
+				}
+			}
+
+			i++
+
 		}
 
-		i++
-
-	}
+		return err
+	}()
 
 	return err
 
@@ -347,6 +370,8 @@ func main() {
 	tmp := os.TempDir()
 
 	tempdir := filepath.Join(tmp, fmt.Sprintf("mapreduce.%d", os.Getpid()))
+
+	fmt.Println("Temp Dir ", tempdir)
 
 	if err := os.RemoveAll(tempdir); err != nil {
 		log.Fatalf("unable to delete old temp dir: %v", err)
