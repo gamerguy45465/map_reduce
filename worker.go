@@ -140,7 +140,8 @@ func createPaths(amount int, typeOfFile int, tmp string) []string {
 		case mapInput:
 			paths = append(paths, filepath.Join(tmp, mapInputFile(i)))
 		case mapOutput:
-			paths = append(paths, filepath.Join(tmp, mapOutputFile(amount, i)))
+			//paths = append(paths, filepath.Join(tmp, mapOutputFile(amount, i)))
+			paths = append(paths, filepath.Join(tmp, mapOutputFile(i, i)))
 		case reduceInput:
 			paths = append(paths, filepath.Join(tmp, reduceInputFile(i)))
 		case reduceOutput:
@@ -164,7 +165,7 @@ func getDatabase(path string) (*sql.DB, error) {
 	return openDatabase(path)
 }
 
-func InsertPairs(task *MapTask, output []Pair) error {
+func InsertPairs(task *MapTask, path string, output []Pair) error {
 	// will insert pairs
 
 	n := task.N
@@ -172,7 +173,7 @@ func InsertPairs(task *MapTask, output []Pair) error {
 		hash := fnv.New32()
 		hash.Write([]byte(pair.Key))
 		r := int(hash.Sum32() % uint32(task.R))
-		outputDB := mapOutputFile(n, r)
+		outputDB := filepath.Join(path, mapOutputFile(n, r))
 		db, err := getDatabase(outputDB)
 		if err != nil {
 			db.Close()
@@ -198,18 +199,19 @@ func (task *MapTask) Process(path string, client Interface) error {
 	file := mapSourceFile(task.N)
 	url := makeURL(getLocalAddress()+":8080", file)
 	mapFile := mapInputFile(task.N)
-	url2 := makeURL(getLocalAddress()+":8080", mapFile)
+	fmt.Println(file)
+	//url2 := makeURL(getLocalAddress()+":8080", mapFile)
 
-	err := download(url, file)
+	err := download(url, mapFile)
 	if err != nil {
 		log.Printf("MapTask.Process: error in downloading path %s: %v", path, err)
 	}
 
-	err = download(url2, mapFile)
+	//err = download(url2, file)
 
-	if err != nil {
-		log.Printf("MapTask.Process: error in downloading path %s: %v", path, err)
-	}
+	//if err != nil {
+	//	log.Printf("MapTask.Process: error in downloading path %s: %v", path, err)
+	//}
 
 	var db *sql.DB
 
@@ -232,7 +234,6 @@ func (task *MapTask) Process(path string, client Interface) error {
 	var value string
 
 	var final_output []Pair
-	Client := new(Client)
 
 	// map process
 	// ... spin up goroutine
@@ -245,7 +246,7 @@ func (task *MapTask) Process(path string, client Interface) error {
 			// call map
 			output := make(chan Pair)
 
-			err = Client.Map(key, value, output)
+			err = client.Map(key, value, output)
 			if err != nil {
 				log.Printf("Client.Map: %v", err)
 			}
@@ -261,7 +262,7 @@ func (task *MapTask) Process(path string, client Interface) error {
 	}()
 	rows.Close()
 
-	err = InsertPairs(task, final_output)
+	err = InsertPairs(task, path, final_output)
 	if err != nil {
 		log.Printf("MapTask.Process: InsertPairs: %v", err)
 	}
@@ -271,11 +272,10 @@ func (task *MapTask) Process(path string, client Interface) error {
 
 //Process for ReduceTask
 
-func (task *ReduceTask) Process(path string, client Interface) error {
+func (task *ReduceTask) Process(path string, client Interface, rfile string) error {
 	var urls []string
 	m := task.M
-	//n := task.N
-	//r := task.R
+
 	i := 0
 	for i < m {
 		file := mapOutputFile(i, task.N)
@@ -284,18 +284,31 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 		i++
 	}
 
-	//temp_file := reduceTempFile(task.N)
-	file := reduceInputFile(task.N)
+	temp := createPaths(1, reduceTemp, path)
 
-	fmt.Println(urls)
+	source := "austen.db"
 
-	//db, err := mergeDatabases(urls, reduceInputFile(task.N), path)
-	db, err := mergeDatabases(urls, file, path)
+	if err := splitDatabase(source, temp); err != nil {
+		log.Fatalf("splitting database: %v", err)
+	}
+
+	//file := reduceInputFile(task.N)
+
+	fmt.Println(temp[0], "\n\n\n\n\n")
+
+	//for i := 0; i < len(temp);i++
+
+	//new_path := filepath.Join(path, rfile)
+
+	fmt.Println(path)
+	db, err := mergeDatabases(urls, rfile, temp[0])
 
 	if err != nil {
 		log.Fatalf("No, merge did not work for some reason ", err)
 		return err
 
+	} else {
+		log.Print("It worked!")
 	}
 	rows, _ := db.Query("select key, value from pairs order by key, value")
 
@@ -304,9 +317,6 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 	// for key, value from input
 	var key string
 	var value string
-
-	//var final_output []Pair
-	//Client := new(Client)
 
 	var keys []string
 	var values <-chan string
@@ -320,7 +330,7 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 				return err
 			}
 
-			fmt.Println("Ran")
+			//fmt.Println("Ran")
 
 			output := make(chan Pair)
 
@@ -330,12 +340,9 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 			if i != 0 {
 				if keys[i-1] != key {
 					output <- Pair{key, value}
-
 				}
 			}
-
 			i++
-
 		}
 
 		return err
@@ -371,7 +378,7 @@ func main() {
 
 	tempdir := filepath.Join(tmp, fmt.Sprintf("mapreduce.%d", os.Getpid()))
 
-	fmt.Println("Temp Dir ", tempdir)
+	//fmt.Println("Temp Dir ", tempdir)
 
 	if err := os.RemoveAll(tempdir); err != nil {
 		log.Fatalf("unable to delete old temp dir: %v", err)
@@ -385,7 +392,15 @@ func main() {
 
 	var paths []string
 
+	//for i := 0; i < m; i++ {
+
 	paths = createPaths(m, mapSource, tempdir)
+	paths_map_input := createPaths(m, mapInput, tempdir)
+	paths_map_output := createPaths(m, mapOutput, tempdir)
+	paths_reduce_input := createPaths(m, reduceInput, tempdir)
+
+	//fmt.Println("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", paths3, "\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+	//}
 
 	/*
 		for i := 0; i < m; i++ {
@@ -394,6 +409,15 @@ func main() {
 	*/
 
 	if err := splitDatabase(source, paths); err != nil {
+		log.Fatalf("splitting database: %v", err)
+	}
+	if err := splitDatabase(source, paths_map_input); err != nil {
+		log.Fatalf("splitting database: %v", err)
+	}
+	if err := splitDatabase(source, paths_map_output); err != nil {
+		log.Fatalf("splitting database: %v", err)
+	}
+	if err := splitDatabase(source, paths_reduce_input); err != nil {
 		log.Fatalf("splitting database: %v", err)
 	}
 
@@ -415,6 +439,8 @@ func main() {
 	}()
 
 	var mapTasks []*MapTask
+
+	//defer os.RemoveAll(tempdir)
 
 	// This is where we are building our map tasks
 	for i := 0; i < m; i++ {
@@ -453,12 +479,15 @@ func main() {
 		}
 	}
 
-	fmt.Println("processed all of map tasks")
+	//fmt.Println("processed all of map tasks")
 
 	//This is where we are processing the reduce tasks
 
+	//fmt.Println("\n\n\n\n\n\n\n\n\n", len(reduceTasks), "\n\n\n\n\n\n")
+
 	for i, task := range reduceTasks {
-		if err := task.Process(tempdir, client); err != nil { //
+		//r_path := filepath.Join(tempdir, paths_reduce_input[i])
+		if err := task.Process(tempdir, client, paths_reduce_input[i]); err != nil { //
 			log.Fatalf("there was an error with processing the reduce task: ", i, err)
 		}
 	}
@@ -471,6 +500,13 @@ func main() {
 	//shell(client)
 
 	*/
+
+	go func() {
+		http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir(tempdir))))
+		if err := http.ListenAndServe(the_address, nil); err != nil {
+			log.Printf("Error in HTTP server for %s: %v", the_address, err)
+		}
+	}()
 
 }
 
