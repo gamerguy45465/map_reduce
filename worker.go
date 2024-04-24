@@ -165,53 +165,43 @@ func getDatabase(path string) (*sql.DB, error) {
 	return openDatabase(path)
 }
 
-func InsertPairs(task *MapTask, path string, output []Pair) error {
+func InsertPair(task *MapTask, path string, pair Pair) error {
 	// will insert pairs
 
 	n := task.N
-	for _, pair := range output {
-		hash := fnv.New32()
-		hash.Write([]byte(pair.Key))
-		r := int(hash.Sum32() % uint32(task.R))
-		outputDB := filepath.Join(path, mapOutputFile(n, r))
-		db, err := getDatabase(outputDB)
-		if err != nil {
-			db.Close()
-			log.Fatalf("InsertPairs: getDatabase: %v", err)
-			return err
-		}
-
-		// insert pairs into the output DB
-		_, err = db.Exec("INSERT INTO pairs (key, value) VALUES (?, ?)", pair.Key, pair.Value)
-		if err != nil {
-			db.Close()
-			log.Fatalf("InsertPairs: error inserting pairs into database: %v", err)
-			return err
-		}
-
+	hash := fnv.New32()
+	hash.Write([]byte(pair.Key))
+	r := int(hash.Sum32() % uint32(task.R))
+	outputDB := mapOutputFile(n, r)
+	db, err := getDatabase(filepath.Join(path, outputDB))
+	if err != nil {
 		db.Close()
+		log.Fatalf("InsertPair: getDatabase: %v", err)
+		return err
 	}
+
+	// insert pairs into the output DB
+	_, err = db.Exec("INSERT INTO pairs (key, value) VALUES (?, ?)", pair.Key, pair.Value)
+	if err != nil {
+		db.Close()
+		log.Fatalf("InsertPair: error inserting pairs into database: %v", err)
+		return err
+	}
+	db.Close()
+
 	return nil
 }
 
 func (task *MapTask) Process(path string, client Interface) error {
 	// make URL
 	file := mapSourceFile(task.N)
-	url := makeURL(getLocalAddress()+":8080", file)
+	url := makeURL(task.SourceHost, file)
 	mapFile := mapInputFile(task.N)
-	fmt.Println(file)
-	//url2 := makeURL(getLocalAddress()+":8080", mapFile)
 
 	err := download(url, mapFile)
 	if err != nil {
 		log.Printf("MapTask.Process: error in downloading path %s: %v", path, err)
 	}
-
-	//err = download(url2, file)
-
-	//if err != nil {
-	//	log.Printf("MapTask.Process: error in downloading path %s: %v", path, err)
-	//}
 
 	var db *sql.DB
 
@@ -223,21 +213,19 @@ func (task *MapTask) Process(path string, client Interface) error {
 	defer db.Close()
 
 	rows, err := db.Query("select key, value from pairs")
-	defer rows.Close()
 	if err != nil {
 		log.Printf("error in select query from database to get pairs: %v", err)
 		return err
 	}
 
-	// for key, value from input
-	var key string
-	var value string
-
-	var final_output []Pair
-
 	// map process
 	// ... spin up goroutine
 	go func() {
+		defer rows.Close()
+		// for key, value from input
+		var key string
+		var value string
+
 		for rows.Next() {
 			if err = rows.Scan(&key, &value); err != nil {
 				log.Fatalf("MapTask.Process: error scanning rows: %v", err)
@@ -246,34 +234,54 @@ func (task *MapTask) Process(path string, client Interface) error {
 			// call map
 			output := make(chan Pair)
 
+			// output
+			go func() {
+				for pair := range output {
+					err = InsertPair(task, path, pair)
+					if err != nil {
+						log.Printf("MapTask.Process: InsertPair: %v", err)
+					}
+				}
+			}()
+
 			err = client.Map(key, value, output)
 			if err != nil {
 				log.Printf("Client.Map: %v", err)
 			}
 
-			// output
-			go func() {
-				for pair := range output {
-					final_output = append(final_output, pair)
-				}
-			}()
 			task.M++
 		}
 	}()
-	rows.Close()
-
-	err = InsertPairs(task, path, final_output)
-	if err != nil {
-		log.Printf("MapTask.Process: InsertPairs: %v", err)
-	}
 
 	return err
 }
 
 //Process for ReduceTask
 
-func (task *ReduceTask) Process(path string, client Interface, rfile string) error {
-	var urls []string
+func (task *ReduceTask) Process(path string, client Interface) error {
+//func (task *ReduceTask) Process(path string, client Interface, rfile string) error {
+	var reduce_temp_files []string
+	//fmt.Println(task.M, task.R)
+	m := 0
+	for m < task.M {
+		file := mapOutputFile(m, task.N)
+		url := makeURL(task.SourceHosts[m], file)
+		reduce_temp_files = append(reduce_temp_files, url)
+		m++
+	}
+
+	db, err := mergeDatabases(reduce_temp_files, reduceInputFile(task.N), reduceTempFile(task.N))
+	if err != nil {
+		log.Fatalf("No, merge did not work for some reason %v", err)
+		return err
+	}
+
+	db.Close()
+	return nil
+
+	// everything works above
+	
+	/*var urls []string
 	m := task.M
 
 	i := 0
@@ -349,7 +357,7 @@ func (task *ReduceTask) Process(path string, client Interface, rfile string) err
 	}()
 
 	return err
-
+	*/
 	//TODO: Need to process all pairs in correct order
 
 }
@@ -369,7 +377,7 @@ func main() {
 	var m int = number_of_rows / page_count
 	var r int = m / 2
 
-	//m := 10
+	//m := 11
 	//r := 5
 
 	//source := "austin.db"
@@ -392,12 +400,14 @@ func main() {
 
 	var paths []string
 
+	paths = createPaths(m, mapSource, tempdir)
+
 	//for i := 0; i < m; i++ {
 
-	paths = createPaths(m, mapSource, tempdir)
-	paths_map_input := createPaths(m, mapInput, tempdir)
-	paths_map_output := createPaths(m, mapOutput, tempdir)
-	paths_reduce_input := createPaths(m, reduceInput, tempdir)
+	//paths = createPaths(m, mapSource, tempdir)
+	//paths_map_input := createPaths(m, mapInput, tempdir)
+	//paths_map_output := createPaths(m, mapOutput, tempdir)
+	//paths_reduce_input := createPaths(m, reduceInput, tempdir)
 
 	//fmt.Println("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", paths3, "\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
 	//}
@@ -411,6 +421,8 @@ func main() {
 	if err := splitDatabase(source, paths); err != nil {
 		log.Fatalf("splitting database: %v", err)
 	}
+
+	/*
 	if err := splitDatabase(source, paths_map_input); err != nil {
 		log.Fatalf("splitting database: %v", err)
 	}
@@ -419,7 +431,7 @@ func main() {
 	}
 	if err := splitDatabase(source, paths_reduce_input); err != nil {
 		log.Fatalf("splitting database: %v", err)
-	}
+	}*/
 
 	the_address := net.JoinHostPort(getLocalAddress(), "8080")
 	log.Print("Here is a new address that we are starting an http server with and it is ", the_address)
@@ -479,7 +491,9 @@ func main() {
 		}
 	}
 
-	//fmt.Println("processed all of map tasks")
+	fmt.Println(tmp)
+	fmt.Println(tempdir)
+	fmt.Println("processed all of map tasks")
 
 	//This is where we are processing the reduce tasks
 
@@ -487,7 +501,8 @@ func main() {
 
 	for i, task := range reduceTasks {
 		//r_path := filepath.Join(tempdir, paths_reduce_input[i])
-		if err := task.Process(tempdir, client, paths_reduce_input[i]); err != nil { //
+		if err := task.Process(tempdir, client); err != nil {
+		//if err := task.Process(tempdir, client, paths_reduce_input[i]); err != nil { //
 			log.Fatalf("there was an error with processing the reduce task: ", i, err)
 		}
 	}
