@@ -11,8 +11,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 )
+
+var mu sync.Mutex
 
 type MapTask struct {
 	M, R       int    // total number of map and reduce tasks
@@ -167,6 +170,8 @@ func getDatabase(path string) (*sql.DB, error) {
 
 func InsertPair(task *MapTask, path string, pair Pair) error {
 	// will insert pairs
+	mu.Lock()
+	defer mu.Unlock()
 
 	n := task.N
 	hash := fnv.New32()
@@ -221,6 +226,8 @@ func (task *MapTask) Process(path string, client Interface) error {
 	// map process
 	// ... spin up goroutine
 	go func() {
+		//mu.Lock()
+		//defer mu.Unlock()
 		defer rows.Close()
 		// for key, value from input
 		var key string
@@ -236,6 +243,8 @@ func (task *MapTask) Process(path string, client Interface) error {
 
 			// output
 			go func() {
+				//mu.Lock()
+				//defer mu.Unlock()
 				for pair := range output {
 					err = InsertPair(task, path, pair)
 					if err != nil {
@@ -259,7 +268,7 @@ func (task *MapTask) Process(path string, client Interface) error {
 //Process for ReduceTask
 
 func (task *ReduceTask) Process(path string, client Interface) error {
-//func (task *ReduceTask) Process(path string, client Interface, rfile string) error {
+	//func (task *ReduceTask) Process(path string, client Interface, rfile string) error {
 	var reduce_temp_files []string
 	//fmt.Println(task.M, task.R)
 	m := 0
@@ -276,11 +285,87 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 		return err
 	}
 
+	var key string
+	var value string
+
+	var keys []string
+	var values <-chan string
+
+	rows, _ := db.Query("select key, value from pairs order by key, value")
+
+	//defer rows.Close()
+
+	i := 0
+
+	//fmt.Println("Ran Here")
+
+	go func() error {
+
+		//fmt.Println("Ran Here")
+
+		//fmt.Println(rows.Next())
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		defer rows.Close()
+
+		for rows.Next() {
+			if err := rows.Scan(&key, &value); err != nil {
+				return err
+			}
+
+			fmt.Println("Ran")
+
+			output := make(chan Pair)
+
+			fmt.Println(key, " ", value)
+
+			err = client.Reduce(key, values, output)
+			if err != nil {
+				log.Printf("Client.Reduce: %v", err)
+			}
+
+			fmt.Println(key)
+			fmt.Println(values)
+			fmt.Println(output)
+
+			keys = append(keys, key)
+			go func() {
+				for pair := range output {
+					fmt.Println(pair)
+				}
+				/*
+					if i != 0 {
+						fmt.Println("Ran")
+						if keys[i-1] != key {
+							fmt.Println("Output")
+							output <- Pair{key, value}
+						}
+					}*/
+			}()
+
+			//err = client.Reduce(key, values, output)
+			//if i != 0 {
+			//fmt.Println("Ran")
+			//	if keys[i-1] != key {
+			//		fmt.Println("Output")
+			//		output <- Pair{key, value}
+			//	}
+		}
+		i++
+		// /}
+
+		return err
+	}()
+
 	db.Close()
+
+	//log.Print("Processed Reduce Tasks")
 	return nil
 
 	// everything works above
-	
+
 	/*var urls []string
 	m := task.M
 
@@ -323,38 +408,6 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 	defer rows.Close()
 
 	// for key, value from input
-	var key string
-	var value string
-
-	var keys []string
-	var values <-chan string
-
-	i = 0
-
-	go func() error {
-
-		for rows.Next() {
-			if err := rows.Scan(&key, &value); err != nil {
-				return err
-			}
-
-			//fmt.Println("Ran")
-
-			output := make(chan Pair)
-
-			err = client.Reduce(key, values, output)
-
-			keys = append(keys, key)
-			if i != 0 {
-				if keys[i-1] != key {
-					output <- Pair{key, value}
-				}
-			}
-			i++
-		}
-
-		return err
-	}()
 
 	return err
 	*/
@@ -423,15 +476,15 @@ func main() {
 	}
 
 	/*
-	if err := splitDatabase(source, paths_map_input); err != nil {
-		log.Fatalf("splitting database: %v", err)
-	}
-	if err := splitDatabase(source, paths_map_output); err != nil {
-		log.Fatalf("splitting database: %v", err)
-	}
-	if err := splitDatabase(source, paths_reduce_input); err != nil {
-		log.Fatalf("splitting database: %v", err)
-	}*/
+		if err := splitDatabase(source, paths_map_input); err != nil {
+			log.Fatalf("splitting database: %v", err)
+		}
+		if err := splitDatabase(source, paths_map_output); err != nil {
+			log.Fatalf("splitting database: %v", err)
+		}
+		if err := splitDatabase(source, paths_reduce_input); err != nil {
+			log.Fatalf("splitting database: %v", err)
+		}*/
 
 	the_address := net.JoinHostPort(getLocalAddress(), "8080")
 	log.Print("Here is a new address that we are starting an http server with and it is ", the_address)
@@ -491,9 +544,9 @@ func main() {
 		}
 	}
 
-	fmt.Println(tmp)
-	fmt.Println(tempdir)
-	fmt.Println("processed all of map tasks")
+	//fmt.Println(tmp)
+	//fmt.Println(tempdir)
+	log.Println("processed all of map tasks")
 
 	//This is where we are processing the reduce tasks
 
@@ -502,10 +555,12 @@ func main() {
 	for i, task := range reduceTasks {
 		//r_path := filepath.Join(tempdir, paths_reduce_input[i])
 		if err := task.Process(tempdir, client); err != nil {
-		//if err := task.Process(tempdir, client, paths_reduce_input[i]); err != nil { //
+			//if err := task.Process(tempdir, client, paths_reduce_input[i]); err != nil { //
 			log.Fatalf("there was an error with processing the reduce task: ", i, err)
 		}
 	}
+
+	log.Print("Processed all of reduce tasks")
 
 	/* NEXT STEP IS WE NEED TO GATHER OUTPUTS INTO FINAL target.db FILE
 
@@ -516,12 +571,12 @@ func main() {
 
 	*/
 
-	go func() {
-		http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir(tempdir))))
-		if err := http.ListenAndServe(the_address, nil); err != nil {
-			log.Printf("Error in HTTP server for %s: %v", the_address, err)
-		}
-	}()
+	//go func() {
+	//	http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir(tempdir))))
+	//	if err := http.ListenAndServe(the_address, nil); err != nil {
+	//		log.Printf("Error in HTTP server for %s: %v", the_address, err)
+	//	}
+	//}()
 
 }
 
