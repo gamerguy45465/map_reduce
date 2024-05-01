@@ -120,16 +120,23 @@ func (c Client) Map(key, value string, output chan<- Pair) error {
 
 func (c Client) Reduce(key string, values <-chan string, output chan<- Pair) error {
 	defer close(output)
+
 	count := 0
+	fmt.Println("125")
 	for v := range values {
+		fmt.Println("127")
+
 		i, err := strconv.Atoi(v)
 		if err != nil {
 			return err
 		}
 		count += i
 	}
+
 	p := Pair{Key: key, Value: strconv.Itoa(count)}
+
 	output <- p
+
 	return nil
 }
 
@@ -168,54 +175,76 @@ func getDatabase(path string) (*sql.DB, error) {
 	return openDatabase(path)
 }
 
-func InsertPair(task *MapTask, path string, pair Pair) error {
-	// will insert pairs
-	mu.Lock()
-	defer mu.Unlock()
-
-	n := task.N
-	hash := fnv.New32()
-	hash.Write([]byte(pair.Key))
-	r := int(hash.Sum32() % uint32(task.R))
-	outputDB := mapOutputFile(n, r)
-	db, err := getDatabase(filepath.Join(path, outputDB))
-	if err != nil {
-		db.Close()
-		log.Fatalf("InsertPair: getDatabase: %v", err)
-		return err
+func InsertPair(r int, n int, db *sql.DB, pairs []Pair) error {
+	for _, pair := range pairs {
+		// insert pairs into the output DB
+		_, err := db.Exec("INSERT INTO pairs (key, value) VALUES (?, ?)", pair.Key, pair.Value)
+		if err != nil {
+			db.Close()
+			log.Fatalf("InsertPair: error inserting pairs into database: %v", err)
+			return err
+		}
 	}
-
-	// insert pairs into the output DB
-	_, err = db.Exec("INSERT INTO pairs (key, value) VALUES (?, ?)", pair.Key, pair.Value)
-	if err != nil {
-		db.Close()
-		log.Fatalf("InsertPair: error inserting pairs into database: %v", err)
-		return err
-	}
-	db.Close()
 
 	return nil
 }
 
 func (task *MapTask) Process(path string, client Interface) error {
 	// make URL
-	file := mapSourceFile(task.N)
-	url := makeURL(task.SourceHost, file)
-	mapFile := mapInputFile(task.N)
+	sourceFile := mapSourceFile(task.N)
+	url := makeURL(task.SourceHost, sourceFile)
+	inputFile := filepath.Join(path, mapInputFile(task.N))
 
-	err := download(url, mapFile)
+	finished := make(chan bool, 1)
+
+	err := download(url, inputFile)
 	if err != nil {
 		log.Printf("MapTask.Process: error in downloading path %s: %v", path, err)
 	}
 
 	var db *sql.DB
 
-	db, err = openDatabase(mapFile)
+	db, err = openDatabase(inputFile)
 	if err != nil {
-		log.Printf("error in op")
+		log.Printf("error in opening inputFile")
 		return err
 	}
-	defer db.Close()
+
+	defer func() {
+		db.Close()
+		os.Remove(inputFile)
+	}()
+
+	outs := make([][]Pair, task.R)
+	dbs := []*sql.DB{}
+	defer func() {
+		if <-finished {
+			done_ := make(chan bool, 1)
+			go func() {
+				for r, elt := range outs {
+					if err := InsertPair(r, task.N, dbs[r], elt); err != nil {
+						fmt.Printf("MapTask.InsertPair: %v", err)
+					}
+					dbs[r].Close()
+				}
+				done_ <- true
+			}()
+			if <-done_ {
+				return
+			}
+		}
+	}()
+
+	// create map output database
+	for i := 0; i < task.R; i++ {
+		outputDB := mapOutputFile(task.N, i)
+		output_database, err := createDatabase(filepath.Join(path, outputDB))
+		if err != nil {
+			output_database.Close()
+			return err
+		}
+		dbs = append(dbs, output_database)
+	}
 
 	rows, err := db.Query("select key, value from pairs")
 	if err != nil {
@@ -224,43 +253,40 @@ func (task *MapTask) Process(path string, client Interface) error {
 	}
 
 	// map process
-	// ... spin up goroutine
-	go func() {
-		//mu.Lock()
-		//defer mu.Unlock()
-		defer rows.Close()
-		// for key, value from input
-		var key string
-		var value string
+	defer rows.Close()
+	// for key, value from input
+	var key string
+	var value string
+	in_count, out_count := 0, 0
 
-		for rows.Next() {
-			if err = rows.Scan(&key, &value); err != nil {
-				log.Fatalf("MapTask.Process: error scanning rows: %v", err)
-			}
-
-			// call map
-			output := make(chan Pair)
-
-			// output
-			go func() {
-				//mu.Lock()
-				//defer mu.Unlock()
-				for pair := range output {
-					err = InsertPair(task, path, pair)
-					if err != nil {
-						log.Printf("MapTask.Process: InsertPair: %v", err)
-					}
-				}
-			}()
-
-			err = client.Map(key, value, output)
-			if err != nil {
-				log.Printf("Client.Map: %v", err)
-			}
-
-			task.M++
+	for rows.Next() {
+		if err = rows.Scan(&key, &value); err != nil {
+			log.Fatalf("MapTask.Process: error scanning rows: %v", err)
 		}
-	}()
+
+		// call map
+		output_ := make(chan Pair)
+
+		// output
+		go func() {
+			for pair := range output_ {
+				hash := fnv.New32()
+				hash.Write([]byte(pair.Key))
+				r := int(hash.Sum32() % uint32(task.R))
+				outs[r] = append(outs[r], pair)
+				out_count++
+			}
+		}()
+
+		err = client.Map(key, value, output_)
+		if err != nil {
+			log.Printf("Client.Map: %v", err)
+		}
+
+		in_count++
+	}
+
+	finished <- true
 
 	return err
 }
@@ -282,82 +308,104 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 	db, err := mergeDatabases(reduce_temp_files, reduceInputFile(task.N), reduceTempFile(task.N))
 	if err != nil {
 		log.Fatalf("No, merge did not work for some reason %v", err)
-		return err
+		//return err
 	}
+
+	// create output file
+	reduceOutputFile := reduceOutputFile(task.N)
+
+	//reduceOutputFile = reduceOutputFile
+
+	// create that database
+	reduceDB, err := createDatabase(filepath.Join(path, reduceOutputFile))
+
+	if err != nil {
+		log.Fatalf("No")
+	}
+
+	reduceDB = reduceDB
 
 	var key string
 	var value string
 
 	var keys []string
-	var values <-chan string
+	values := make(chan string)
+	//var values <-chan string
 
 	rows, _ := db.Query("select key, value from pairs order by key, value")
 
 	//defer rows.Close()
 
-	i := 0
-
 	//fmt.Println("Ran Here")
 
-	go func() error {
+	defer rows.Close()
 
-		//fmt.Println("Ran Here")
+	// variables
+	previous := ""
 
-		//fmt.Println(rows.Next())
+	for rows.Next() {
 
-		mu.Lock()
-		defer mu.Unlock()
+		if err := rows.Scan(&key, &value); err != nil {
+			return err
+		}
 
-		defer rows.Close()
+		if len(previous) == 0 {
+			previous = key
+		}
+		//fmt.Println("Ran")
 
-		for rows.Next() {
-			if err := rows.Scan(&key, &value); err != nil {
-				return err
+		output := make(chan Pair)
+
+		go func() {
+			//output <- Pair{Value: value, Key: key}
+			//new_value := <-values
+			//new_value = new_value
+
+			fmt.Println("Went here")
+
+			for pair := range output {
+				fmt.Println(pair, "pair")
 			}
+		}()
 
-			fmt.Println("Ran")
+		fmt.Println(key, " key/value ", value)
 
-			output := make(chan Pair)
-
-			fmt.Println(key, " ", value)
-
+		if key != previous {
 			err = client.Reduce(key, values, output)
 			if err != nil {
 				log.Printf("Client.Reduce: %v", err)
 			}
-
-			fmt.Println(key)
-			fmt.Println(values)
-			fmt.Println(output)
-
-			keys = append(keys, key)
-			go func() {
-				for pair := range output {
-					fmt.Println(pair)
-				}
-				/*
-					if i != 0 {
-						fmt.Println("Ran")
-						if keys[i-1] != key {
-							fmt.Println("Output")
-							output <- Pair{key, value}
-						}
-					}*/
-			}()
-
-			//err = client.Reduce(key, values, output)
-			//if i != 0 {
-			//fmt.Println("Ran")
-			//	if keys[i-1] != key {
-			//		fmt.Println("Output")
-			//		output <- Pair{key, value}
-			//	}
+			previous = key
+			values = make(chan string)
+		} else {
+			values <- key
 		}
-		i++
-		// /}
 
-		return err
-	}()
+		fmt.Println(key, " key")
+		fmt.Println(values, " value")
+		fmt.Println(output, " output")
+
+		keys = append(keys, key)
+
+		//p := Pair{Value: value, Key: key}
+		/*
+			if i != 0 {
+				fmt.Println("Ran")
+				if keys[i-1] != key {
+					fmt.Println("Output")
+					output <- Pair{key, value}
+				}
+			}*/
+		//}()
+
+		//err = client.Reduce(key, values, output)
+		//if i != 0 {
+		//fmt.Println("Ran")
+		//	if keys[i-1] != key {
+		//		fmt.Println("Output")
+		//		output <- Pair{key, value}
+		//	}
+	}
 
 	db.Close()
 
