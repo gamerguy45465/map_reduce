@@ -120,12 +120,8 @@ func (c Client) Map(key, value string, output chan<- Pair) error {
 
 func (c Client) Reduce(key string, values <-chan string, output chan<- Pair) error {
 	defer close(output)
-
 	count := 0
-	fmt.Println("125")
 	for v := range values {
-		fmt.Println("127")
-
 		i, err := strconv.Atoi(v)
 		if err != nil {
 			return err
@@ -134,9 +130,7 @@ func (c Client) Reduce(key string, values <-chan string, output chan<- Pair) err
 	}
 
 	p := Pair{Key: key, Value: strconv.Itoa(count)}
-
 	output <- p
-
 	return nil
 }
 
@@ -214,7 +208,7 @@ func (task *MapTask) Process(path string, client Interface) error {
 		db.Close()
 		os.Remove(inputFile)
 	}()
-
+	
 	outs := make([][]Pair, task.R)
 	dbs := []*sql.DB{}
 	defer func() {
@@ -294,9 +288,7 @@ func (task *MapTask) Process(path string, client Interface) error {
 //Process for ReduceTask
 
 func (task *ReduceTask) Process(path string, client Interface) error {
-	//func (task *ReduceTask) Process(path string, client Interface, rfile string) error {
 	var reduce_temp_files []string
-	//fmt.Println(task.M, task.R)
 	m := 0
 	for m < task.M {
 		file := mapOutputFile(m, task.N)
@@ -305,7 +297,7 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 		m++
 	}
 
-	db, err := mergeDatabases(reduce_temp_files, reduceInputFile(task.N), reduceTempFile(task.N))
+	db, err := mergeDatabases(reduce_temp_files, filepath.Join(path, reduceInputFile(task.N)), reduceTempFile(task.N))
 	if err != nil {
 		log.Fatalf("No, merge did not work for some reason %v", err)
 		//return err
@@ -330,13 +322,16 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 
 	var keys []string
 	values := make(chan string)
-	//var values <-chan string
+
+	done := make(chan bool, 1)
+	var outs []Pair
+	defer func() {
+		if <-done {
+			fmt.Println(outs)
+		}
+	}()
 
 	rows, _ := db.Query("select key, value from pairs order by key, value")
-
-	//defer rows.Close()
-
-	//fmt.Println("Ran Here")
 
 	defer rows.Close()
 
@@ -349,11 +344,6 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 			return err
 		}
 
-		if len(previous) == 0 {
-			previous = key
-		}
-		//fmt.Println("Ran")
-
 		output := make(chan Pair)
 
 		go func() {
@@ -361,55 +351,38 @@ func (task *ReduceTask) Process(path string, client Interface) error {
 			//new_value := <-values
 			//new_value = new_value
 
-			fmt.Println("Went here")
+			//fmt.Println("Went here")
 
 			for pair := range output {
-				fmt.Println(pair, "pair")
+				outs = append(outs, pair)
+				//fmt.Println(pair, "pair")
 			}
+			return
 		}()
 
-		fmt.Println(key, " key/value ", value)
-
-		if key != previous {
-			err = client.Reduce(key, values, output)
-			if err != nil {
-				log.Printf("Client.Reduce: %v", err)
-			}
+		if previous != key {
 			previous = key
+			keys = append(keys, previous)
+			close(values)
+			finished := make(chan error)
 			values = make(chan string)
-		} else {
-			values <- key
-		}
-
-		fmt.Println(key, " key")
-		fmt.Println(values, " value")
-		fmt.Println(output, " output")
-
-		keys = append(keys, key)
-
-		//p := Pair{Value: value, Key: key}
-		/*
-			if i != 0 {
-				fmt.Println("Ran")
-				if keys[i-1] != key {
-					fmt.Println("Output")
-					output <- Pair{key, value}
+			
+			go func() {
+				err = client.Reduce(key, values, output)
+				if err != nil {
+					log.Printf("Client.Reduce: %v", err)
 				}
-			}*/
-		//}()
-
-		//err = client.Reduce(key, values, output)
-		//if i != 0 {
-		//fmt.Println("Ran")
-		//	if keys[i-1] != key {
-		//		fmt.Println("Output")
-		//		output <- Pair{key, value}
-		//	}
+				finished <- err
+				return
+			}()
+		}
+		values <- value
 	}
+
+	done <- true
 
 	db.Close()
 
-	//log.Print("Processed Reduce Tasks")
 	return nil
 
 	// everything works above
